@@ -1,0 +1,7 @@
+pip install pyrealsense2 opencv-python numpy
+
+for images only: 
+rs-convert -i grabacion.bag -p salida_png/
+
+everything: 
+python align_official.py
