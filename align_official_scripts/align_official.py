@@ -1,13 +1,18 @@
-#pip install pyrealsense2 numpy opencv-python
+# pip install pyrealsense2 numpy opencv-python
 
 import pyrealsense2 as rs
 import numpy as np
 import cv2
 import os
+import time
 from datetime import datetime
+
+SETTINGS_FILE = "../calibration_settings/d435i_outdoor_device_settings.json"
+
 
 def clamp(value, min_v, max_v):
     return max(min_v, min(value, max_v))
+
 
 def get_option_info(sensor, option):
     if sensor.supports(option):
@@ -15,13 +20,15 @@ def get_option_info(sensor, option):
         return r.min, r.max, r.step, r.default
     return None
 
+
 def safe_get(sensor, option, fallback=None):
     try:
         if sensor.supports(option):
             return sensor.get_option(option)
-    except:
+    except Exception:
         pass
     return fallback
+
 
 def safe_set(sensor, option, value):
     try:
@@ -31,6 +38,7 @@ def safe_set(sensor, option, value):
     except Exception as e:
         print(f"No se pudo ajustar {option}: {e}")
     return False
+
 
 def apply_preset(depth_sensor, preset_value):
     ok = safe_set(depth_sensor, rs.option.visual_preset, float(preset_value))
@@ -43,10 +51,64 @@ def apply_preset(depth_sensor, preset_value):
         print(f"Preset aplicado: {preset_names.get(preset_value, preset_value)}")
     return ok
 
+
+def find_d400_device():
+    ctx = rs.context()
+    devices = ctx.query_devices()
+
+    if len(devices) == 0:
+        raise RuntimeError("No se encontró ninguna cámara RealSense conectada.")
+
+    for dev in devices:
+        try:
+            name = dev.get_info(rs.camera_info.name)
+            product_line = dev.get_info(rs.camera_info.product_line)
+            print(f"Dispositivo encontrado: {name} | línea: {product_line}")
+            if product_line == "D400":
+                return dev
+        except Exception:
+            continue
+
+    raise RuntimeError("No se encontró un dispositivo de la serie D400.")
+
+
+def load_viewer_settings(settings_file):
+    device = find_d400_device()
+    adv = rs.rs400_advanced_mode(device)
+
+    if not adv.is_enabled():
+        print("Activando advanced mode...")
+        adv.toggle_advanced_mode(True)
+        time.sleep(2.0)
+
+        # Después de activar advanced mode, el dispositivo puede reconectarse
+        device = find_d400_device()
+        adv = rs.rs400_advanced_mode(device)
+
+    with open(settings_file, "r", encoding="utf-8") as f:
+        json_text = f.read()
+
+    print(f"Cargando settings desde: {settings_file}")
+    adv.load_json(json_text)
+    time.sleep(1.0)
+    print("Settings del viewer aplicados correctamente.")
+
+
 def main():
     save_dir = "captures_realsense"
     os.makedirs(save_dir, exist_ok=True)
 
+    # 1) Cargar al dispositivo la configuración exportada del viewer
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            load_viewer_settings(SETTINGS_FILE)
+        except Exception as e:
+            print(f"No se pudieron cargar los settings JSON: {e}")
+            print("Se continuará con configuración manual.")
+    else:
+        print(f"No se encontró el archivo {SETTINGS_FILE}. Se continuará sin cargar JSON.")
+
+    # 2) Iniciar pipeline
     pipeline = rs.pipeline()
     config = rs.config()
 
@@ -75,24 +137,26 @@ def main():
     if exposure_info:
         print("Exposure range:", exposure_info)
 
-    # Configuración inicial
-    apply_preset(depth_sensor, 3)  # High Accuracy
+    # 3) Configuración inicial solo como respaldo
+    # Si el JSON ya cargó, estas líneas sirven solo para mantener consistencia.
     safe_set(depth_sensor, rs.option.emitter_enabled, 1)
 
     if laser_info:
         laser_min, laser_max, laser_step, _ = laser_info
-        safe_set(depth_sensor, rs.option.laser_power, laser_max)
+        current_laser = safe_get(depth_sensor, rs.option.laser_power, None)
+        if current_laser is None:
+            safe_set(depth_sensor, rs.option.laser_power, laser_max)
 
     if autoexp_info:
-        safe_set(depth_sensor, rs.option.enable_auto_exposure, 1)
+        current_autoexp = safe_get(depth_sensor, rs.option.enable_auto_exposure, None)
+        if current_autoexp is None:
+            safe_set(depth_sensor, rs.option.enable_auto_exposure, 1)
 
-    # Filtros
-    decimation = rs.decimation_filter()
+    # 4) Filtros
+    # No usamos decimation para no romper el tamaño al hacer overlay.
     spatial = rs.spatial_filter()
     temporal = rs.temporal_filter()
     hole_filling = rs.hole_filling_filter()
-
-    decimation.set_option(rs.option.filter_magnitude, 2)
 
     spatial.set_option(rs.option.filter_magnitude, 2)
     spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
@@ -138,6 +202,7 @@ def main():
             aligned_depth = np.asanyarray(processed_depth.get_data())
             color_image = np.asanyarray(color_frame.get_data())
 
+            # Normalización visual a grayscale
             depth_m = aligned_depth.astype(np.float32) * depth_scale
             min_m = 0.4
             max_m = 2.5
@@ -145,6 +210,15 @@ def main():
             depth_gray = ((depth_clipped - min_m) / (max_m - min_m) * 255).astype(np.uint8)
 
             depth_gray_bgr = cv2.cvtColor(depth_gray, cv2.COLOR_GRAY2BGR)
+
+            # Seguridad extra por si alguna operación cambia el tamaño
+            if depth_gray_bgr.shape[:2] != color_image.shape[:2]:
+                depth_gray_bgr = cv2.resize(
+                    depth_gray_bgr,
+                    (color_image.shape[1], color_image.shape[0]),
+                    interpolation=cv2.INTER_NEAREST
+                )
+
             overlay = cv2.addWeighted(color_image, 0.7, depth_gray_bgr, 0.3, 0)
 
             # Texto de estado
@@ -262,7 +336,7 @@ def main():
                 cv2.imwrite(overlay_path, overlay_text)
                 np.save(depth_raw_path, aligned_depth)
 
-                print(f"Captura guardada:")
+                print("Captura guardada:")
                 print(f"  {color_path}")
                 print(f"  {depth_gray_path}")
                 print(f"  {overlay_path}")
@@ -271,6 +345,7 @@ def main():
     finally:
         pipeline.stop()
         cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()

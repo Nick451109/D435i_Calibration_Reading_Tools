@@ -5,3 +5,7 @@ rs-convert -i grabacion.bag -p salida_png/
 
 everything: 
 python align_official.py
+
+virtual env: 
+python3 -m venv .venv
+source .venv/bin/activate
