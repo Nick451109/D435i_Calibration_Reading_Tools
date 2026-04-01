@@ -81,7 +81,7 @@ def load_viewer_settings(settings_file):
         adv.toggle_advanced_mode(True)
         time.sleep(2.0)
 
-        # Después de activar advanced mode, el dispositivo puede reconectarse
+        # El dispositivo puede reconectarse
         device = find_d400_device()
         adv = rs.rs400_advanced_mode(device)
 
@@ -98,7 +98,7 @@ def main():
     save_dir = "captures_realsense"
     os.makedirs(save_dir, exist_ok=True)
 
-    # 1) Cargar al dispositivo la configuración exportada del viewer
+    # 1) Cargar settings exportados del viewer
     if os.path.exists(SETTINGS_FILE):
         try:
             load_viewer_settings(SETTINGS_FILE)
@@ -137,8 +137,7 @@ def main():
     if exposure_info:
         print("Exposure range:", exposure_info)
 
-    # 3) Configuración inicial solo como respaldo
-    # Si el JSON ya cargó, estas líneas sirven solo para mantener consistencia.
+    # Configuración de respaldo
     safe_set(depth_sensor, rs.option.emitter_enabled, 1)
 
     if laser_info:
@@ -152,8 +151,13 @@ def main():
         if current_autoexp is None:
             safe_set(depth_sensor, rs.option.enable_auto_exposure, 1)
 
-    # 4) Filtros
-    # No usamos decimation para no romper el tamaño al hacer overlay.
+    # 3) Filtros
+    # Nota:
+    # Aquí aplicamos el orden corregido sobre processed_depth,
+    # pero rs.align trabaja sobre el frameset original.
+    # Esto deja el script estable y utilizable sin reconstrucción manual del frameset.
+    depth_to_disparity = rs.disparity_transform(True)
+    disparity_to_depth = rs.disparity_transform(False)
     spatial = rs.spatial_filter()
     temporal = rs.temporal_filter()
     hole_filling = rs.hole_filling_filter()
@@ -166,6 +170,7 @@ def main():
     temporal.set_option(rs.option.filter_smooth_delta, 20)
 
     filters_enabled = True
+    hole_filling_enabled = True
 
     print("\nControles:")
     print("  1 = Default preset")
@@ -179,30 +184,43 @@ def main():
     print("  r = bajar exposure")
     print("  a = alternar auto exposure")
     print("  f = alternar filtros")
+    print("  o = alternar hole filling")
     print("  c = capturar")
     print("  ESC = salir\n")
 
     try:
         while True:
             frames = pipeline.wait_for_frames()
-            aligned_frames = align.process(frames)
 
-            depth_frame = aligned_frames.get_depth_frame()
-            color_frame = aligned_frames.get_color_frame()
+            depth_frame = frames.get_depth_frame()
+            color_frame = frames.get_color_frame()
 
             if not depth_frame or not color_frame:
                 continue
 
+            # Pipeline corregido de filtros sobre depth sin alinear
             processed_depth = depth_frame
             if filters_enabled:
+                processed_depth = depth_to_disparity.process(processed_depth)
                 processed_depth = spatial.process(processed_depth)
                 processed_depth = temporal.process(processed_depth)
-                processed_depth = hole_filling.process(processed_depth)
+                processed_depth = disparity_to_depth.process(processed_depth)
 
-            aligned_depth = np.asanyarray(processed_depth.get_data())
-            color_image = np.asanyarray(color_frame.get_data())
+                if hole_filling_enabled:
+                    processed_depth = hole_filling.process(processed_depth)
 
-            # Normalización visual a grayscale
+            # Alineación del frameset original (estable)
+            aligned_frames = align.process(frames)
+            aligned_color_frame = aligned_frames.get_color_frame()
+            aligned_depth_frame = aligned_frames.get_depth_frame()
+
+            if not aligned_color_frame or not aligned_depth_frame:
+                continue
+
+            color_image = np.asanyarray(aligned_color_frame.get_data())
+            aligned_depth = np.asanyarray(aligned_depth_frame.get_data())
+
+            # Visualización en grayscale
             depth_m = aligned_depth.astype(np.float32) * depth_scale
             min_m = 0.4
             max_m = 2.5
@@ -211,7 +229,6 @@ def main():
 
             depth_gray_bgr = cv2.cvtColor(depth_gray, cv2.COLOR_GRAY2BGR)
 
-            # Seguridad extra por si alguna operación cambia el tamaño
             if depth_gray_bgr.shape[:2] != color_image.shape[:2]:
                 depth_gray_bgr = cv2.resize(
                     depth_gray_bgr,
@@ -221,7 +238,7 @@ def main():
 
             overlay = cv2.addWeighted(color_image, 0.7, depth_gray_bgr, 0.3, 0)
 
-            # Texto de estado
+            # Estado
             laser_val = safe_get(depth_sensor, rs.option.laser_power, -1)
             gain_val = safe_get(depth_sensor, rs.option.gain, -1)
             exposure_val = safe_get(depth_sensor, rs.option.exposure, -1)
@@ -232,7 +249,8 @@ def main():
                 f"Gain:{gain_val:.1f}  "
                 f"Exposure:{exposure_val:.1f}  "
                 f"AutoExp:{int(autoexp_val) if autoexp_val is not None else -1}  "
-                f"Filtros:{'ON' if filters_enabled else 'OFF'}"
+                f"Filtros:{'ON' if filters_enabled else 'OFF'}  "
+                f"Hole:{'ON' if hole_filling_enabled else 'OFF'}"
             )
 
             overlay_text = overlay.copy()
@@ -323,6 +341,10 @@ def main():
             elif key == ord('f'):
                 filters_enabled = not filters_enabled
                 print(f"Filtros -> {'ON' if filters_enabled else 'OFF'}")
+
+            elif key == ord('o'):
+                hole_filling_enabled = not hole_filling_enabled
+                print(f"Hole filling -> {'ON' if hole_filling_enabled else 'OFF'}")
 
             elif key == ord('c'):
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
